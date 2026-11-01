@@ -75,7 +75,7 @@ jobs:
             const myReleases = await github.paginate(github.rest.repos.listReleases, {
               owner: myOwner,
               repo: myRepo,
-              per_page: 200
+              per_page: 1000
             });
             // 同一标签同时存在草稿和正式版本时，优先使用正式版本。
             const myReleaseByTag = new Map();
