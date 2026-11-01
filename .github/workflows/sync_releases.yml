@@ -214,5 +214,3 @@ jobs:
           body: |
             ${{ github.event.repository.name }} Releases 同步已完成。
             本次同步版本：${{ steps.sync.outputs.summary }}
-
-==============================================================
