@@ -1,0 +1,60 @@
+name: Copy upstream release assets
+on:
+  push:
+    branches: [sync-upstream-releases]
+    paths: [.github/workflows/copy-upstream-releases.yml]
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  copy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        tag: [toolchain, tools, kernel_stable, kernel_rk35xx, kernel_rk3588, kernel_flippy, kernel_beta]
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ matrix.tag }}
+    steps:
+      - name: Copy release and verify assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          src="ophub/kernel"
+          dst="${GITHUB_REPOSITORY}"
+          meta="$(mktemp)"
+          gh api "repos/$src/releases/tags/$TAG" > "$meta"
+          jq -r '.body // ""' "$meta" > notes.md
+          if ! gh release view "$TAG" -R "$dst" >/dev/null 2>&1; then
+            args=()
+            if [ "$(jq -r '.prerelease' "$meta")" = true ]; then args+=(--prerelease); fi
+            gh release create "$TAG" -R "$dst" --target main --title "$(jq -r '.name // .tag_name' "$meta")" --notes-file notes.md "${args[@]}"
+          fi
+          release_id="$(jq -r '.id' "$meta")"
+          gh api --paginate "repos/$src/releases/$release_id/assets?per_page=100" --jq '.[] | @base64' > assets.txt
+          mkdir -p asset
+          failures=0
+          while IFS= read -r encoded; do
+            item="$(printf '%s' "$encoded" | base64 -d)"
+            name="$(jq -r '.name' <<< "$item")"
+            url="$(jq -r '.browser_download_url' <<< "$item")"
+            expected="$(jq -r '.digest // ""' <<< "$item")"
+            if gh release view "$TAG" -R "$dst" --json assets --jq '.assets[].name' | grep -Fxq -- "$name"; then
+              echo "Already present: $name"
+              continue
+            fi
+            echo "Copying: $name"
+            if ! curl --fail --location --retry 5 --retry-all-errors --output "asset/$name" "$url"; then
+              echo "::error::Download failed: $name"; failures=$((failures+1)); rm -f -- "asset/$name"; continue
+            fi
+            if [[ "$expected" == sha256:* ]] && ! echo "${expected#sha256:}  asset/$name" | sha256sum -c -; then
+              echo "::error::Checksum failed: $name"; failures=$((failures+1)); rm -f -- "asset/$name"; continue
+            fi
+            if ! gh release upload "$TAG" "asset/$name" -R "$dst"; then
+              echo "::error::Upload failed: $name"; failures=$((failures+1))
+            fi
+            rm -f -- "asset/$name"
+          done < assets.txt
+          test "$failures" -eq 0
