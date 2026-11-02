@@ -2,7 +2,7 @@ name: Pure API Sync Releases
 
 on:
   schedule:
-    - cron: '0 0 * * 1'  # 每周一 UTC 00:00 (北京时间 08:00)
+    - cron: '0 0,12 * * *' # 每 12 小时自动检查
   workflow_dispatch:      # 支持手动运行
 
 concurrency:
@@ -16,7 +16,7 @@ jobs:
     steps:
       - name: Sync via GitHub API
         id: sync
-        uses: actions/github-script@v7
+        uses: actions/github-script@v8
         env:
           # Schedule uses the default branch; workflow_dispatch uses the selected branch.
           SYNC_TARGET_BRANCH: ${{ github.ref_name }}
@@ -65,18 +65,18 @@ jobs:
               }
             }
 
-            console.log("正在获取上游所有 Releases...");
-            const upstreamReleases = await github.paginate(github.rest.repos.listReleases, {
+            console.log("正在获取上游最近 10 个 Releases...");
+            const upstreamReleases = await github.rest.repos.listReleases({
               owner: upstreamOwner,
               repo: upstreamRepo,
-              per_page: 100
+              per_page: 10
             });
 
             console.log("正在检查目标仓库已有的 Releases...");
             const myReleases = await github.paginate(github.rest.repos.listReleases, {
               owner: myOwner,
               repo: myRepo,
-              per_page: 100
+              per_page: 1000
             });
             // 同一标签同时存在草稿和正式版本时，优先使用正式版本。
             const myReleaseByTag = new Map();
@@ -87,9 +87,11 @@ jobs:
               }
             }
             const syncedTags = [];
+            const skippedDraftTags = [];
+            const draftMarker = "<!-- managed-by-release-sync-v1 -->";
 
             // Oldest first, so release order remains chronological.
-            for (const release of upstreamReleases.reverse()) {
+            for (const release of upstreamReleases.data.reverse()) {
               // 按标签直接查找正式版本，避免重复创建、发布同名草稿。
               // 只有 404 才回退到列表；权限、限流和服务错误直接抛出。
               let targetRelease;
@@ -105,6 +107,12 @@ jobs:
                 targetRelease = myReleaseByTag.get(release.tag_name);
               }
               let createdNow = false;
+              // Never modify or publish a draft that was not created by this workflow.
+              if (targetRelease?.draft && !(targetRelease.body || "").includes(draftMarker)) {
+                skippedDraftTags.push(release.tag_name);
+                core.warning(`跳过手动创建的草稿 Release：${release.tag_name}`);
+                continue;
+              }
 
               if (!targetRelease) {
                 console.log(`[开始] 创建草稿 Release ${release.tag_name}（${release.assets.length} 个附件）...`);
@@ -114,7 +122,7 @@ jobs:
                   tag_name: release.tag_name,
                   target_commitish: targetBranch,
                   name: release.name || release.tag_name,
-                  body: release.body || "自动同步自上游仓库更新日志。",
+                  body: (release.body || "自动同步自上游仓库更新日志。") + "\n\n" + draftMarker,
                   draft: true,
                   prerelease: release.prerelease
                 });
@@ -147,12 +155,24 @@ jobs:
               try {
 
               for (const asset of upstreamAssets) {
-                if (!asset.digest || !asset.digest.startsWith("sha256:")) {
-                  throw new Error("上游文件缺少 SHA-256 摘要，无法安全校验：" + asset.name);
+                let downloaded = false;
+                const downloadAndHash = () => {
+                  console.log("[下载] " + asset.name);
+                  execFileSync("curl", ["--fail", "--location", "--silent", "--show-error", "--retry", "5", "--retry-all-errors", "--output", file, asset.browser_download_url], { stdio: "inherit" });
+                  if (fs.statSync(file).size !== asset.size) throw new Error("下载大小不匹配：" + asset.name);
+                  downloaded = true;
+                  return "sha256:" + execFileSync("sha256sum", [file], { encoding: "utf8" }).split(" ")[0];
+                };
+                if (!asset.digest) {
+                  // Older GitHub assets may not expose a digest. Compute one from the download.
+                  asset.digest = downloadAndHash();
+                } else if (!asset.digest.startsWith("sha256:")) {
+                  throw new Error("不支持的摘要算法：" + asset.name);
                 }
                 const old = existingByName.get(asset.name);
                 if (matches(asset, old)) {
-                  console.log("[跳过] " + asset.name + " 摘要一致。");
+                  console.log("[跳过] " + asset.name + " SHA-256摘要一致。");
+                  if (downloaded) fs.unlinkSync(file);
                   continue;
                 }
 
@@ -164,21 +184,19 @@ jobs:
                   staged = null;
                 }
                 if (!staged) {
-                  console.log("[下载] " + asset.name);
-                  execFileSync("curl", ["--fail", "--location", "--silent", "--show-error", "--retry", "5", "--retry-all-errors", "--output", file, asset.browser_download_url], { stdio: "inherit" });
-                  const actualSize = fs.statSync(file).size;
-                  const hash = execFileSync("sha256sum", [file], { encoding: "utf8" }).split(" ")[0];
-                  if (actualSize !== asset.size || "sha256:" + hash !== asset.digest) {
+                  if (!downloaded && downloadAndHash() !== asset.digest) {
                     throw new Error("下载校验失败：" + asset.name);
                   }
                   const uploadUrl = "https://uploads.github.com/repos/" + encodeURIComponent(myOwner) + "/" + encodeURIComponent(myRepo) + "/releases/" + targetRelease.id + "/assets?name=" + encodeURIComponent(stagedName);
                   const response = execFileSync("curl", ["--config", config, "--fail-with-body", "--silent", "--show-error",
                     "--request", "POST", "--header", "Content-Type: " + (asset.content_type || "application/octet-stream"),
-                    "--data-binary", "@" + file, uploadUrl], { encoding: "utf8", maxBuffer: 1024 * 1024 });
+                    "--upload-file", file, uploadUrl], { encoding: "utf8", maxBuffer: 1024 * 1024 });
                   staged = JSON.parse(response);
                   fs.unlinkSync(file);
                   if (!matches(asset, staged)) throw new Error("上传校验失败：" + asset.name);
+                  downloaded = false;
                 }
+                if (downloaded) fs.unlinkSync(file);
                 if (old) {
                   await github.rest.repos.deleteReleaseAsset({ owner: myOwner, repo: myRepo, asset_id: old.id });
                 }
@@ -214,6 +232,7 @@ jobs:
                   owner: myOwner,
                   repo: myRepo,
                   release_id: targetRelease.id,
+                  body: (targetRelease.body || "").replace(draftMarker, "").trimEnd(),
                   draft: false
                 });
                 console.log(`[发布完成] ${release.tag_name}，共 ${uploadedAssets.length} 个附件。`);
@@ -228,6 +247,7 @@ jobs:
 
             core.setOutput("synced", String(syncedTags.length > 0));
             core.setOutput("summary", syncedTags.join(", "));
+            core.setOutput("skipped_drafts", skippedDraftTags.join(", "));
 
       - name: Send sync notification email
         if: steps.sync.outputs.synced == 'true'
@@ -244,3 +264,11 @@ jobs:
           body: |
             ${{ github.event.repository.name }} Releases 同步已完成。
             本次同步版本：${{ steps.sync.outputs.summary }}
+
+      - name: Report skipped manual drafts
+        if: steps.sync.outputs.skipped_drafts != ''
+        env:
+          SKIPPED_DRAFTS: ${{ steps.sync.outputs.skipped_drafts }}
+        run: |
+          echo "::error::未同步以下手动草稿 Release：$SKIPPED_DRAFTS"
+          exit 1
